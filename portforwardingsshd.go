@@ -121,8 +121,7 @@ func handleDirectTCPIP(sConn *ssh.ServerConn, newChan ssh.NewChannel, info *stDi
 		strconv.FormatInt(int64(info.DestPort), 10),
 	)
 
-	var dialer net.Dialer
-	dconn, err := dialer.Dial("tcp", dest)
+	dconn, err := net.DialTimeout("tcp", dest, time.Minute)
 	if err != nil {
 		newChan.Reject(ssh.ConnectionFailed, err.Error())
 		return
