@@ -10,11 +10,11 @@ import (
 	"io"
 	"log"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/akutz/memconn"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -24,14 +24,14 @@ const (
 	serverVersion = "SSH-2.0-OpenSSH_8.4p1"
 )
 
-var (
-	listeners map[uint32]chan struct{}
-	lock      *sync.Mutex
-)
-
 type stBindInfo struct {
 	Addr string
 	Port uint32
+}
+
+type stListeners struct {
+	*sync.Mutex
+	list map[uint32]chan struct{}
 }
 
 type stDirectInfo struct {
@@ -39,6 +39,20 @@ type stDirectInfo struct {
 	DestPort   uint32
 	OriginAddr string
 	OriginPort uint32
+}
+
+func listenerMake(l *stListeners, port uint32) {
+	defer l.Unlock()
+	l.Lock()
+
+	l.list[port] = make(chan struct{})
+}
+
+func listenerDelete(l *stListeners, port uint32) {
+	defer l.Unlock()
+	l.Lock()
+
+	delete(l.list, port)
 }
 
 func getRSAKeys() (*rsa.PublicKey, *rsa.PrivateKey, error) {
@@ -116,12 +130,8 @@ func serve(channel ssh.Channel, conn net.Conn, client *ssh.ServerConn, timeout t
 }
 
 func handleDirectTCPIP(sConn *ssh.ServerConn, newChan ssh.NewChannel, info *stDirectInfo) {
-	dest := net.JoinHostPort(
-		info.DestAddr,
-		strconv.FormatInt(int64(info.DestPort), 10),
-	)
-
-	dconn, err := net.DialTimeout("tcp", dest, time.Minute)
+	dest := fmt.Sprintf(":%d", info.DestPort)
+	dconn, err := memconn.Dial("memu", dest)
 	if err != nil {
 		newChan.Reject(ssh.ConnectionFailed, err.Error())
 		return
@@ -137,7 +147,7 @@ func handleDirectTCPIP(sConn *ssh.ServerConn, newChan ssh.NewChannel, info *stDi
 	go serve(ch, dconn, sConn, time.Minute)
 }
 
-func handleForwardTCPIP(sConn *ssh.ServerConn, req *ssh.Request, payload []byte) {
+func handleForwardTCPIP(sConn *ssh.ServerConn, req *ssh.Request, payload []byte, listeners *stListeners) {
 	r := stBindInfo{}
 
 	if err := ssh.Unmarshal(payload, &r); err != nil {
@@ -153,14 +163,15 @@ func handleForwardTCPIP(sConn *ssh.ServerConn, req *ssh.Request, payload []byte)
 	go func(addr string, port uint32) {
 		var listener net.Listener
 
-		if v, ok := listeners[port]; ok {
+		if v, ok := listeners.list[port]; ok {
 			v <- struct{}{}
 		}
 
 		for i := 0; i < retries; i++ {
 			var err error
 
-			listener, err = net.Listen("tcp", net.JoinHostPort(addr, fmt.Sprintf("%d", port)))
+			listenport := fmt.Sprintf(":%d", port)
+			listener, err = memconn.Listen("memu", listenport)
 			if err != nil {
 				if i < retries-1 {
 					log.Printf("handleRequests: net.Listen returned: %v", err.Error())
@@ -173,16 +184,12 @@ func handleForwardTCPIP(sConn *ssh.ServerConn, req *ssh.Request, payload []byte)
 			break
 		}
 
-		lock.Lock()
-		listeners[port] = make(chan struct{})
-		lock.Unlock()
+		listenerMake(listeners, port)
 
 		go func(port uint32) {
-			<-listeners[port]
+			<-listeners.list[port]
 
-			lock.Lock()
-			delete(listeners, port)
-			lock.Unlock()
+			listenerDelete(listeners, port)
 
 			log.Printf("handleRequests: Drop listener from %v", port)
 
@@ -209,19 +216,16 @@ func handleForwardTCPIP(sConn *ssh.ServerConn, req *ssh.Request, payload []byte)
 }
 
 func serveForwardTCPIP(sConn *ssh.ServerConn, bindinfo *stBindInfo, lconn net.Conn) {
-	remotetcpaddr := lconn.RemoteAddr().(*net.TCPAddr)
-	raddr := remotetcpaddr.IP.String()
-	rport := uint32(remotetcpaddr.Port)
+	raddr := lconn.RemoteAddr().(memconn.Addr)
 
-	payload := stDirectInfo{
+	payload := ssh.Marshal(&stDirectInfo{
 		bindinfo.Addr,
 		bindinfo.Port,
-		raddr,
-		uint32(rport),
-	}
-	mpayload := ssh.Marshal(&payload)
+		raddr.String(),
+		0,
+	})
 
-	c, requests, err := sConn.OpenChannel("forwarded-tcpip", mpayload)
+	c, requests, err := sConn.OpenChannel("forwarded-tcpip", payload)
 	if err != nil {
 		log.Printf("[%v] Unable to get channel: %s. Hanging up requesting party!", sConn, err)
 		lconn.Close()
@@ -233,11 +237,11 @@ func serveForwardTCPIP(sConn *ssh.ServerConn, bindinfo *stBindInfo, lconn net.Co
 	go serve(c, lconn, sConn, time.Minute)
 }
 
-func handleRequests(sConn *ssh.ServerConn, chans <-chan *ssh.Request) {
+func handleRequests(sConn *ssh.ServerConn, listeners *stListeners, chans <-chan *ssh.Request) {
 	for req := range chans {
 		switch req.Type {
 		case "tcpip-forward":
-			handleForwardTCPIP(sConn, req, req.Payload)
+			handleForwardTCPIP(sConn, req, req.Payload, listeners)
 
 		case "keepalive@openssh.com":
 			fallthrough
@@ -284,9 +288,9 @@ func handleServerConn(sConn *ssh.ServerConn, chans <-chan ssh.NewChannel) {
 	}
 }
 
-func handleListen(config *ssh.ServerConfig, host string, port int) {
+func handleListen(config *ssh.ServerConfig, listeners *stListeners, host string, port int) {
 
-	ip := net.JoinHostPort(host, fmt.Sprintf("%v", port))
+	ip := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	listener, err := net.Listen("tcp", ip)
 	if err != nil {
 		log.Fatalf("Failed to start SSH server: %v", err)
@@ -308,21 +312,7 @@ func handleListen(config *ssh.ServerConfig, host string, port int) {
 			/* time.Sleep(15 * time.Second) */
 			sConn, chans, reqs, err := ssh.NewServerConn(conn, config)
 			if err != nil {
-				if err == io.EOF {
-					log.Printf("SSH: Handshaking was terminated by EOF: %v", err)
-				} else if strings.Contains(err.Error(), "no common algorithm for host key") {
-					log.Printf("SSH: Handshaking was terminated by failed auth: %v", err)
-				} else if strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("SSH: Handshaking was terminated by closed conn: %v", err)
-				} else if strings.Contains(err.Error(), "invalid packet length") {
-					log.Printf("SSH: Handshaking was terminated: %v", err)
-				} else if strings.Contains(err.Error(), "connection reset by peer") {
-					log.Printf("SSH: Handshaking was terminated: %v", err)
-				} else if strings.Contains(err.Error(), "no auth passed yet") {
-					log.Printf("SSH: Auth handshaking was terminated: %v", err)
-				} else {
-					log.Fatalf("SSH: Error on handshaking: %v", err)
-				}
+				log.Printf("SSH: Error on handshaking: %v", err)
 				return
 			}
 
@@ -334,8 +324,8 @@ func handleListen(config *ssh.ServerConfig, host string, port int) {
 				sConn.ClientVersion(),
 			)
 
-			go handleRequests(sConn, reqs)
 			go handleServerConn(sConn, chans)
+			go handleRequests(sConn, listeners, reqs)
 
 			if e := sConn.Wait(); e != nil {
 				log.Printf("sConn Wait err %v", e.Error())
@@ -354,7 +344,7 @@ func listen(host string, port int, ciphers []string) {
 
 	authKey, err := ssh.NewPublicKey(authPubKey)
 	if err != nil {
-		log.Fatalf("Error getting NewPublicKey %v", err)
+		log.Fatalf("Error getting auth NewPublicKey %v", err)
 	}
 
 	sshPubKey, sshPrivKey, err := getRSAKeys()
@@ -364,12 +354,12 @@ func listen(host string, port int, ciphers []string) {
 
 	sshPrivSigner, err := ssh.NewSignerFromKey(sshPrivKey)
 	if err != nil {
-		log.Fatalf("Error getting private signer %v", err)
+		log.Fatalf("Error getting host private signer %v", err)
 	}
 
 	hostPubKey, err := ssh.NewPublicKey(sshPubKey)
 	if err != nil {
-		log.Fatalf("Error getting public key %v", err)
+		log.Fatalf("Error getting host public key %v", err)
 	}
 
 	err = pem.Encode(
@@ -414,14 +404,16 @@ func listen(host string, port int, ciphers []string) {
 		ssh.MarshalAuthorizedKey(hostPubKey),
 	)
 
-	handleListen(config, host, port)
+	listeners := &stListeners{
+		&sync.Mutex{},
+		make(map[uint32]chan struct{}),
+	}
+
+	handleListen(config, listeners, host, port)
 }
 
 func main() {
-	lock = &sync.Mutex{}
-	listeners = make(map[uint32]chan struct{})
-
-	listen("", 2022, []string{
+	listen("localhost", 2022, []string{
 		"aes256-ctr",
 		"aes128-ctr",
 	})
