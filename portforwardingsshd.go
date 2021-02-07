@@ -5,11 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -129,7 +131,74 @@ func serve(channel ssh.Channel, conn net.Conn, client *ssh.ServerConn, timeout t
 	}()
 }
 
-func handleDirectTCPIP(sConn *ssh.ServerConn, newChan ssh.NewChannel, info *stDirectInfo) {
+func sshDisconnectReturnCode(connection ssh.Channel, exitCode int) {
+	ret := make([]byte, 4)
+	binary.BigEndian.PutUint32(ret, uint32(exitCode))
+
+	connection.SendRequest("exit-status", false, ret)
+	connection.Close()
+}
+
+func handleChannelSession(newChannel ssh.NewChannel, sConn *ssh.ServerConn) {
+	connection, requests, err := newChannel.Accept()
+	if err != nil {
+		log.Printf("Could not accept channel (%s)", err)
+		return
+	}
+
+	for req := range requests {
+		switch req.Type {
+		case "exec":
+			cmdLen := binary.BigEndian.Uint32(req.Payload[:4])
+			command := strings.TrimSpace(
+				string(req.Payload[4 : 4+cmdLen]),
+			)
+
+			cmdargs := strings.Split(command, " ")
+
+			switch cmdargs[0] {
+			case "/usr/bin/nc":
+				fallthrough
+			case "nc":
+				switch cmdargs[1] {
+				case "127.0.0.1":
+					fallthrough
+				case "localhost":
+					port, err := strconv.ParseInt(cmdargs[2], 10, 16)
+					if err != nil {
+						req.Reply(false, []byte("Unable to parse port"))
+						sshDisconnectReturnCode(connection, 3)
+					}
+
+					dest := fmt.Sprintf(":%d", port)
+					conn, err := memconn.Dial("memu", dest)
+					if err != nil {
+						req.Reply(false, []byte("Connection refused"))
+						sshDisconnectReturnCode(connection, 4)
+					}
+
+					go serve(connection, conn, sConn, time.Minute)
+
+				default:
+					req.Reply(false, []byte("Unknown host"))
+					sshDisconnectReturnCode(connection, 2)
+				}
+
+			default:
+				req.Reply(false, []byte("Unknown Command"))
+				sshDisconnectReturnCode(connection, 1)
+
+			}
+
+			req.Reply(true, nil)
+
+		default:
+			req.Reply(false, []byte("Unsupported req type"))
+		}
+	}
+}
+
+func handleChannelDirectTCPIP(sConn *ssh.ServerConn, newChan ssh.NewChannel, info *stDirectInfo) {
 	dest := fmt.Sprintf(":%d", info.DestPort)
 	dconn, err := memconn.Dial("memu", dest)
 	if err != nil {
@@ -263,13 +332,16 @@ func handleRequests(sConn *ssh.ServerConn, listeners *stListeners, chans <-chan 
 	}
 }
 
-func handleServerConn(sConn *ssh.ServerConn, chans <-chan ssh.NewChannel) {
+func handleServerChans(sConn *ssh.ServerConn, chans <-chan ssh.NewChannel) {
 	for newChan := range chans {
 		switch newChan.ChannelType() {
-		case "direct-tcpip":
-			d := &stDirectInfo{}
+		case "session":
+			handleChannelSession(newChan, sConn)
 
-			if e := ssh.Unmarshal(newChan.ExtraData(), d); e != nil {
+		case "direct-tcpip":
+			connectInfo := &stDirectInfo{}
+
+			if e := ssh.Unmarshal(newChan.ExtraData(), connectInfo); e != nil {
 				newChan.Reject(
 					ssh.ConnectionFailed,
 					fmt.Sprintf(
@@ -279,7 +351,7 @@ func handleServerConn(sConn *ssh.ServerConn, chans <-chan ssh.NewChannel) {
 				)
 			}
 
-			handleDirectTCPIP(sConn, newChan, d)
+			handleChannelDirectTCPIP(sConn, newChan, connectInfo)
 
 		default:
 			log.Printf("handleRequests: Dunno %v", newChan.ChannelType())
@@ -324,7 +396,7 @@ func handleListen(config *ssh.ServerConfig, listeners *stListeners, host string,
 				sConn.ClientVersion(),
 			)
 
-			go handleServerConn(sConn, chans)
+			go handleServerChans(sConn, chans)
 			go handleRequests(sConn, listeners, reqs)
 
 			if e := sConn.Wait(); e != nil {
