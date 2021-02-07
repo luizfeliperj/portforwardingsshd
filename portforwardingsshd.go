@@ -485,7 +485,7 @@ func listen(host string, port int, ciphers []string) {
 }
 
 func main() {
-	listen("localhost", 2022, []string{
+	listen("", 22, []string{
 		"aes256-ctr",
 		"aes128-ctr",
 	})
