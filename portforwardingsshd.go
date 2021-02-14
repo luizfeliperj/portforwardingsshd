@@ -253,10 +253,12 @@ func handleForwardTCPIP(sConn *ssh.ServerConn, req *ssh.Request, payload []byte,
 			break
 		}
 
+		handleClose := make(chan struct{})
 		listenerMake(listeners, port)
 
 		go func(port uint32) {
 			<-listeners.list[port]
+			handleClose <- struct{}{}
 
 			listenerDelete(listeners, port)
 
@@ -266,10 +268,25 @@ func handleForwardTCPIP(sConn *ssh.ServerConn, req *ssh.Request, payload []byte,
 		}(port)
 
 		for {
-			conn, err := listener.Accept()
+			handleAccept := make(chan struct{})
+			useofclosed := "use of closed network connection"
+
+			var err error
+			var conn net.Conn
+
+			go func() {
+				conn, err = listener.Accept()
+				handleAccept <- struct{}{}
+			}()
+
+			select {
+			case <-handleClose:
+				err = fmt.Errorf(useofclosed)
+			case <-handleAccept:
+			}
+
 			if err != nil {
 				e := err.Error()
-				useofclosed := "use of closed network connection"
 				if 0 == strings.Compare(e[len(e)-len(useofclosed):], useofclosed) {
 					break
 				}
@@ -381,7 +398,6 @@ func handleListen(config *ssh.ServerConfig, listeners *stListeners, host string,
 			defer conn.Close()
 
 			log.Printf("SSH: Handshaking for %s", conn.RemoteAddr())
-			/* time.Sleep(15 * time.Second) */
 			sConn, chans, reqs, err := ssh.NewServerConn(conn, config)
 			if err != nil {
 				log.Printf("SSH: Error on handshaking: %v", err)
